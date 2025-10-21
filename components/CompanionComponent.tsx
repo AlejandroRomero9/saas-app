@@ -1,6 +1,7 @@
 'use client'
 
-import { Orb } from '@/components/ui/orb' // <-- IMPORT CORRECTO del Orb de ElevenLabs UI
+import { LiveWaveform } from '@/components/ui/live-waveform'
+import { Orb } from '@/components/ui/orb'
 import { cn, configureAssistant, getSubjectColor } from '@/lib/utils'
 import { vapi } from '@/lib/vapi.sdk'
 import Image from 'next/image'
@@ -52,34 +53,24 @@ const CompanionComponent = ({
   const [messages, setMessages] = useState<SavedMessage[]>([])
   const [agentState, setAgentState] = useState<AgentState>(null)
 
-  // =========================
-  // AUDIO -> ORB
-  // =========================
-  // volumen crudo que llega del SDK (0..1)
-  const rawVolRef = useRef(0)
-  // volumen suavizado que consume el Orb
-  const smoothVolRef = useRef(0)
+  // ========= ORB (salida del agente) =========
+  const rawVolRef = useRef(0) // 0..1 desde SDK (evento 'volume-level')
+  const smoothVolRef = useRef(0) // suavizado para animación
   const rafRef = useRef<number | null>(null)
-  // debug opcional
   const [debugVol, setDebugVol] = useState(0)
 
-  // smoothing en RAF
+  // smoothing del volumen (para que el orb “respire”)
   useEffect(() => {
     const tick = () => {
       const target = rawVolRef.current
       const attack = 0.35
       const decay = 0.12
       const speed = target > smoothVolRef.current ? attack : decay
-
       smoothVolRef.current += (target - smoothVolRef.current) * speed
-      // cap para no llegar a 1.0 (se ve mejor)
       const capped = Math.min(0.85, Math.max(0, smoothVolRef.current))
       smoothVolRef.current = capped
       setDebugVol(capped)
-
-      // Cambiamos el estado visual del agente (opcional, queda más “vivo”)
       setAgentState(capped > 0.06 ? 'talking' : null)
-
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -88,10 +79,9 @@ const CompanionComponent = ({
     }
   }, [])
 
-  // suscribir volumen del SDK (evento volume-level de Vapi)
+  // suscripción al volumen del asistente
   useEffect(() => {
     const onVol = (vol: number) => {
-      // normaliza/boost leve y clamp
       const v = Math.max(0, Math.min(1, vol * 1.2))
       rawVolRef.current = v
     }
@@ -101,20 +91,28 @@ const CompanionComponent = ({
     }
   }, [])
 
-  const getInputVolume = () => 0 // no usamos mic
+  const getInputVolume = () => 0 // el Orb no usa tu mic
   const getOutputVolume = () => smoothVolRef.current
 
-  // =========================
-  // EVENTOS DE LA LLAMADA
-  // =========================
+  // ========= LiveWaveform (tu voz) =========
+  // se enciende solo cuando tú inicias sesión (click) y se apaga al colgar/mutear
+  const [waveActive, setWaveActive] = useState(false)
+
+  // ========= Eventos de la llamada, transcript, etc. =========
   useEffect(() => {
-    const onCallStart = () => setCallStatus(CallStatus.ACTIVE)
+    const onCallStart = () => {
+      setCallStatus(CallStatus.ACTIVE)
+      // OPCIONAL: encender wave al empezar si no está muteado
+      setWaveActive((prev) => prev || !isMuted)
+    }
     const onCallEnd = () => {
       setCallStatus(CallStatus.FINISHED)
       setAgentState(null)
       rawVolRef.current = 0
       smoothVolRef.current = 0
       setDebugVol(0)
+      // apagar wave al terminar
+      setWaveActive(false)
     }
     const onMessage = (message: Message) => {
       if (
@@ -126,55 +124,67 @@ const CompanionComponent = ({
         setMessages((prev) => [newMessage, ...prev])
       }
     }
+    const onError = (err: Error) => console.log('Error:', err)
+    const onSpeechStart = () => setAgentState('talking')
+    const onSpeechEnd = () => setAgentState(null)
 
     vapi.on('call-start', onCallStart)
     vapi.on('call-end', onCallEnd)
     vapi.on('message', onMessage)
-    vapi.on('error', (err: Error) => console.log('Error:', err))
-    vapi.on('speech-start', () => setAgentState('talking'))
-    vapi.on('speech-end', () => setAgentState(null))
+    vapi.on('error', onError)
+    vapi.on('speech-start', onSpeechStart)
+    vapi.on('speech-end', onSpeechEnd)
 
     return () => {
       vapi.off('call-start', onCallStart)
       vapi.off('call-end', onCallEnd)
       vapi.off('message', onMessage)
-      vapi.off('error', (err: Error) => console.log('Error:', err))
-      vapi.off('speech-start', () => setAgentState('talking'))
-      vapi.off('speech-end', () => setAgentState(null))
+      vapi.off('error', onError)
+      vapi.off('speech-start', onSpeechStart)
+      vapi.off('speech-end', onSpeechEnd)
     }
-  }, [])
+  }, [isMuted])
 
-  // =========================
-  // CONTROLES MICRO/SESIÓN
-  // =========================
+  // ========= Controles mic/sesión =========
   const toggleMicrophone = () => {
     const muted = vapi.isMuted()
     vapi.setMuted(!muted)
     setIsMuted(!muted)
+    // si muteas, apaga el wave; si desmuteas y la call sigue activa, vuelve a encender
+    if (!muted) {
+      setWaveActive(false)
+    } else if (callStatus === CallStatus.ACTIVE) {
+      setWaveActive(true)
+    }
   }
 
   const handleCall = async () => {
     setCallStatus(CallStatus.CONNECTING)
+
+    // Encender el waveform desde el click (user gesture),
+    // algunos navegadores lo prefieren para abrir el mic sin fricciones.
+    setWaveActive(true)
+
     const assistantOverrides = {
       variableValues: { subject, topic, style },
       clientMessages: ['transcript'],
       serverMessages: []
     }
-    // @ts-expect-error: tipado de start puede variar
+    // @ts-expect-error: tipado de start puede variar según tu SDK
     vapi.start(configureAssistant(voice, style), assistantOverrides)
   }
 
   const handleDisconnect = () => {
     setCallStatus(CallStatus.FINISHED)
     vapi.stop()
+    // apagar el waveform
+    setWaveActive(false)
   }
 
-  // =========================
-  // UI
-  // =========================
   return (
     <section className='flex flex-col h-[70vh]'>
       <section className='flex gap-8 max-sm:flex-col'>
+        {/* LADO AGENTE */}
         <div className='companion-section'>
           <div
             className='companion-avatar relative'
@@ -210,18 +220,12 @@ const CompanionComponent = ({
             >
               <div className='w-[170px] h-[170px]'>
                 <Orb
-                  // props de audio reactivity por función (doc oficial)
                   getInputVolume={getInputVolume}
                   getOutputVolume={getOutputVolume}
-                  // estado visual del agente (opcional, mejora la percepción)
                   agentState={agentState}
-                  // si quieres forzar colores:
-                  // colors={["#CADCFC", "#A0B9D1"]}
-                  // seed={1234}
                 />
               </div>
-
-              {/* Debug: quítalo cuando confirmes que sube */}
+              {/* Debug: quítalo si no lo quieres */}
               <div className='absolute bottom-2 text-xs bg-black/50 text-white px-2 py-1 rounded'>
                 vol: {debugVol.toFixed(2)}
               </div>
@@ -230,37 +234,54 @@ const CompanionComponent = ({
           <p className='font-bold text-2xl'>{name}</p>
         </div>
 
-        <div className='user-section'>
-          <div className='user-avatar'>
+        {/* LADO USUARIO */}
+        <div className='user-section w-full max-w-xs'>
+          <div className='user-avatar flex items-center gap-3'>
             <Image
               src={userImage}
               alt={userName}
-              width={130}
-              height={130}
+              width={60}
+              height={60}
               className='rounded-lg'
             />
-            <p className='font-bold text-2xl'>{userName}</p>
+            <p className='font-bold text-xl'>{userName}</p>
           </div>
 
-          <button
-            className='btn-mic'
-            onClick={toggleMicrophone}
-            disabled={callStatus !== CallStatus.ACTIVE}
-          >
-            <Image
-              src={isMuted ? '/icons/mic-off.svg' : '/icons/mic-on.svg'}
-              alt={isMuted ? 'Unmute' : 'Mute'}
-              width={36}
-              height={36}
+          {/* Waveform TU MIC - wave arriba, botón abajo */}
+          <div className='mt-4 w-full rounded-xl border border-neutral-200 bg-white/60 p-3 shadow-sm'>
+            <LiveWaveform
+              key={`wf-${waveActive}-${isMuted}-${callStatus}`}
+              // Solo activo si: lo encendiste, la call está activa y no estás muteado
+              active={
+                waveActive && callStatus === CallStatus.ACTIVE && !isMuted
+              }
+              // Muestra animación de “procesando” durante CONNECTING
+              processing={callStatus === CallStatus.CONNECTING}
+              // Visual y respuesta
+              mode='static'
             />
-            <p className='max-sm:hidden '>
-              {isMuted ? 'Turn on microphone' : 'Turn off microphone'}
-            </p>
-          </button>
 
+            <button
+              className={cn(
+                'mt-3 rounded-lg py-2 cursor-pointer transition-colors w-full text-white',
+                callStatus === CallStatus.ACTIVE
+                  ? isMuted
+                    ? 'bg-neutral-500'
+                    : 'bg-red-700'
+                  : 'bg-neutral-400',
+                callStatus === CallStatus.CONNECTING && 'animate-pulse'
+              )}
+              onClick={toggleMicrophone}
+              disabled={callStatus !== CallStatus.ACTIVE}
+            >
+              {isMuted ? 'Turn on microphone' : 'Turn off microphone'}
+            </button>
+          </div>
+
+          {/* Botón de llamar/colgar */}
           <button
             className={cn(
-              'rounded-lg py-2 cursor-pointer transition-colors w-full text-white',
+              'mt-3 rounded-lg py-2 cursor-pointer transition-colors w-full text-white',
               callStatus === CallStatus.ACTIVE ? 'bg-red-700 ' : 'bg-primary',
               callStatus === CallStatus.CONNECTING && 'animate-pulse'
             )}
@@ -277,6 +298,7 @@ const CompanionComponent = ({
         </div>
       </section>
 
+      {/* TRANSCRIPCIÓN */}
       <section className='transcript'>
         <div className='transcript-message no-scrollbar'>
           {messages.map((message, index) => {
