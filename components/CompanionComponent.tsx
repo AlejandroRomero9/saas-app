@@ -5,7 +5,7 @@ import { Orb } from '@/components/ui/orb'
 import { cn, configureAssistant, getSubjectColor } from '@/lib/utils'
 import { vapi } from '@/lib/vapi.sdk'
 import Image from 'next/image'
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 interface SavedMessage {
   role: 'assistant' | 'user'
@@ -38,6 +38,18 @@ enum CallStatus {
 
 type AgentState = null | 'thinking' | 'listening' | 'talking'
 
+/** Helper simple para aclarar un color #RRGGBB */
+function lighten(hex: string, amt = 0.2) {
+  const n = hex.replace('#', '')
+  const r = parseInt(n.slice(0, 2), 16)
+  const g = parseInt(n.slice(2, 4), 16)
+  const b = parseInt(n.slice(4, 6), 16)
+  const L = (x: number) =>
+    Math.min(255, Math.max(0, Math.round(x + (255 - x) * amt)))
+  const toHex = (x: number) => x.toString(16).padStart(2, '0')
+  return `#${toHex(L(r))}${toHex(L(g))}${toHex(L(b))}`
+}
+
 const CompanionComponent = ({
   companionId,
   subject,
@@ -59,7 +71,23 @@ const CompanionComponent = ({
   const rafRef = useRef<number | null>(null)
   const [debugVol, setDebugVol] = useState(0)
 
-  // smoothing del volumen (para que el orb “respire”)
+  // Estados/refs de Orb “avanzado”
+  const [orbState, setOrbState] = useState<null | 'listening' | 'talking'>(null)
+  const colorsRef = useRef<string[] | null>(null)
+  const orbSeedRef = useRef<number>(Math.floor(Math.random() * 10_000))
+
+  // Paletas para listening/talking en base al subject color
+  const base = getSubjectColor(subject)
+  const listeningColors = useMemo(
+    () => [lighten(base, 0.35), lighten(base, 0.15)],
+    [base]
+  )
+  const talkingColors = useMemo(() => {
+    const warm = '#FF7A59'
+    return [warm, lighten(warm, 0.25)]
+  }, [])
+
+  // smoothing del volumen (para que el orb “respire” al hablar el agente)
   useEffect(() => {
     const tick = () => {
       const target = rawVolRef.current
@@ -70,7 +98,7 @@ const CompanionComponent = ({
       const capped = Math.min(0.85, Math.max(0, smoothVolRef.current))
       smoothVolRef.current = capped
       setDebugVol(capped)
-      setAgentState(capped > 0.06 ? 'talking' : null)
+      // Nota: agentState global lo seguimos usando para trazas; orbState visualizará el Orb
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -91,18 +119,15 @@ const CompanionComponent = ({
     }
   }, [])
 
-  const getInputVolume = () => 0 // el Orb no usa tu mic
-  const getOutputVolume = () => smoothVolRef.current
-
   // ========= LiveWaveform (tu voz) =========
-  // se enciende solo cuando tú inicias sesión (click) y se apaga al colgar/mutear
+  // se enciende solo cuando inicias sesión y se apaga al mutear/colgar
   const [waveActive, setWaveActive] = useState(false)
 
   // ========= Eventos de la llamada, transcript, etc. =========
   useEffect(() => {
     const onCallStart = () => {
       setCallStatus(CallStatus.ACTIVE)
-      // OPCIONAL: encender wave al empezar si no está muteado
+      // opcional: enciende el wave si no está muteado
       setWaveActive((prev) => prev || !isMuted)
     }
     const onCallEnd = () => {
@@ -111,7 +136,6 @@ const CompanionComponent = ({
       rawVolRef.current = 0
       smoothVolRef.current = 0
       setDebugVol(0)
-      // apagar wave al terminar
       setWaveActive(false)
     }
     const onMessage = (message: Message) => {
@@ -145,12 +169,67 @@ const CompanionComponent = ({
     }
   }, [isMuted])
 
+  // ========= Máquina de estados del Orb (listening/talking) =========
+  useEffect(() => {
+    // Histeresis para estabilidad
+    const TALK_ON = 0.07
+    const TALK_OFF = 0.05
+
+    let raf: number | null = null
+    let current: null | 'listening' | 'talking' = null
+
+    const step = () => {
+      const out = smoothVolRef.current
+      const agentTalking =
+        current === 'talking' ? out > TALK_OFF : out > TALK_ON
+
+      let next: null | 'listening' | 'talking' = null
+      if (agentTalking) {
+        next = 'talking'
+      } else if (callStatus === CallStatus.ACTIVE && !isMuted && waveActive) {
+        next = 'listening'
+      } else {
+        next = null
+      }
+
+      if (next !== current) {
+        current = next
+        setOrbState(next)
+        // Cambia paleta suavemente
+        colorsRef.current =
+          next === 'talking'
+            ? talkingColors
+            : next === 'listening'
+            ? listeningColors
+            : listeningColors
+      }
+
+      raf = requestAnimationFrame(step)
+    }
+
+    raf = requestAnimationFrame(step)
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+    }
+  }, [callStatus, isMuted, waveActive, listeningColors, talkingColors])
+
+  // ========= Getters para el Orb =========
+  // No usamos el mic real para input; damos una “respiración” cuando escucha.
+  const getInputVolume = () => {
+    if (orbState === 'listening') {
+      const t = performance.now() / 600
+      return 0.085 + Math.sin(t) * 0.035 // 0.05–0.12 aprox
+    }
+    return 0
+  }
+  const getOutputVolume = () => smoothVolRef.current
+
   // ========= Controles mic/sesión =========
   const toggleMicrophone = () => {
     const muted = vapi.isMuted()
     vapi.setMuted(!muted)
     setIsMuted(!muted)
-    // si muteas, apaga el wave; si desmuteas y la call sigue activa, vuelve a encender
+    // si muteas, apaga el wave; si desmuteas y la call sigue activa, enciéndelo
     if (!muted) {
       setWaveActive(false)
     } else if (callStatus === CallStatus.ACTIVE) {
@@ -160,9 +239,7 @@ const CompanionComponent = ({
 
   const handleCall = async () => {
     setCallStatus(CallStatus.CONNECTING)
-
-    // Encender el waveform desde el click (user gesture),
-    // algunos navegadores lo prefieren para abrir el mic sin fricciones.
+    // activar el wave desde el click (user gesture)
     setWaveActive(true)
 
     const assistantOverrides = {
@@ -170,14 +247,13 @@ const CompanionComponent = ({
       clientMessages: ['transcript'],
       serverMessages: []
     }
-    // @ts-expect-error: tipado de start puede variar según tu SDK
+    // @ts-expect-error: tipado de start puede variar
     vapi.start(configureAssistant(voice, style), assistantOverrides)
   }
 
   const handleDisconnect = () => {
     setCallStatus(CallStatus.FINISHED)
     vapi.stop()
-    // apagar el waveform
     setWaveActive(false)
   }
 
@@ -222,12 +298,16 @@ const CompanionComponent = ({
                 <Orb
                   getInputVolume={getInputVolume}
                   getOutputVolume={getOutputVolume}
-                  agentState={agentState}
+                  agentState={orbState} // 'listening' | 'talking' | null
+                  // paleta inicial
+                  seed={orbSeedRef.current} // patrón consistente
+                  // motionIntensity={orbState === 'talking' ? 1.0 : 0.65}
+                  // detail={0.9}
                 />
               </div>
               {/* Debug: quítalo si no lo quieres */}
               <div className='absolute bottom-2 text-xs bg-black/50 text-white px-2 py-1 rounded'>
-                vol: {debugVol.toFixed(2)}
+                vol: {debugVol.toFixed(2)} | state: {orbState ?? 'idle'}
               </div>
             </div>
           </div>
@@ -251,14 +331,21 @@ const CompanionComponent = ({
           <div className='mt-4 w-full rounded-xl border border-neutral-200 bg-white/60 p-3 shadow-sm'>
             <LiveWaveform
               key={`wf-${waveActive}-${isMuted}-${callStatus}`}
-              // Solo activo si: lo encendiste, la call está activa y no estás muteado
               active={
                 waveActive && callStatus === CallStatus.ACTIVE && !isMuted
               }
-              // Muestra animación de “procesando” durante CONNECTING
               processing={callStatus === CallStatus.CONNECTING}
-              // Visual y respuesta
               mode='static'
+              height={64}
+              barWidth={3}
+              barGap={2}
+              fadeEdges
+              historySize={120}
+              sensitivity={1.6}
+              smoothingTimeConstant={0.65}
+              fftSize={256}
+              updateRate={30}
+              // Importante: NO apagar waveActive desde estos callbacks
             />
 
             <button
@@ -323,7 +410,7 @@ const CompanionComponent = ({
             }
           })}
         </div>
-        <div className='transcript-fade' />
+        {/* <div className='transcript-fade' /> */}
       </section>
     </section>
   )
