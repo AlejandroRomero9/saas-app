@@ -2,6 +2,7 @@
 
 import { LiveWaveform } from '@/components/ui/live-waveform'
 import { Orb } from '@/components/ui/orb'
+import { addToSessionHistory } from '@/lib/actions/companion.actions'
 import { cn, configureAssistant, getSubjectColor } from '@/lib/utils'
 import { vapi } from '@/lib/vapi.sdk'
 import Image from 'next/image'
@@ -38,7 +39,6 @@ enum CallStatus {
 
 type AgentState = null | 'thinking' | 'listening' | 'talking'
 
-/** Helper simple para aclarar un color #RRGGBB */
 function lighten(hex: string, amt = 0.2) {
   const n = hex.replace('#', '')
   const r = parseInt(n.slice(0, 2), 16)
@@ -63,13 +63,13 @@ const CompanionComponent = ({
   const [callStatus, setCallStatus] = useState<CallStatus>(CallStatus.INACTIVE)
   const [isMuted, setIsMuted] = useState<boolean>(false)
   const [messages, setMessages] = useState<SavedMessage[]>([])
-  const [agentState, setAgentState] = useState<AgentState>(null)
+  const [, setAgentState] = useState<AgentState>(null)
 
   // ========= ORB (salida del agente) =========
-  const rawVolRef = useRef(0) // 0..1 desde SDK (evento 'volume-level')
-  const smoothVolRef = useRef(0) // suavizado para animación
+  const rawVolRef = useRef(0)
+  const smoothVolRef = useRef(0)
   const rafRef = useRef<number | null>(null)
-  const [debugVol, setDebugVol] = useState(0)
+  const [, setDebugVol] = useState(0)
 
   // Estados/refs de Orb “avanzado”
   const [orbState, setOrbState] = useState<null | 'listening' | 'talking'>(null)
@@ -98,7 +98,6 @@ const CompanionComponent = ({
       const capped = Math.min(0.85, Math.max(0, smoothVolRef.current))
       smoothVolRef.current = capped
       setDebugVol(capped)
-      // Nota: agentState global lo seguimos usando para trazas; orbState visualizará el Orb
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -107,7 +106,6 @@ const CompanionComponent = ({
     }
   }, [])
 
-  // suscripción al volumen del asistente
   useEffect(() => {
     const onVol = (vol: number) => {
       const v = Math.max(0, Math.min(1, vol * 1.2))
@@ -119,15 +117,13 @@ const CompanionComponent = ({
     }
   }, [])
 
-  // ========= LiveWaveform (tu voz) =========
+  // ========= LiveWaveform =========
   // se enciende solo cuando inicias sesión y se apaga al mutear/colgar
   const [waveActive, setWaveActive] = useState(false)
 
-  // ========= Eventos de la llamada, transcript, etc. =========
   useEffect(() => {
     const onCallStart = () => {
       setCallStatus(CallStatus.ACTIVE)
-      // opcional: enciende el wave si no está muteado
       setWaveActive((prev) => prev || !isMuted)
     }
     const onCallEnd = () => {
@@ -137,6 +133,7 @@ const CompanionComponent = ({
       smoothVolRef.current = 0
       setDebugVol(0)
       setWaveActive(false)
+      addToSessionHistory(companionId)
     }
     const onMessage = (message: Message) => {
       if (
@@ -171,7 +168,6 @@ const CompanionComponent = ({
 
   // ========= Máquina de estados del Orb (listening/talking) =========
   useEffect(() => {
-    // Histeresis para estabilidad
     const TALK_ON = 0.07
     const TALK_OFF = 0.05
 
@@ -195,7 +191,7 @@ const CompanionComponent = ({
       if (next !== current) {
         current = next
         setOrbState(next)
-        // Cambia paleta suavemente
+
         colorsRef.current =
           next === 'talking'
             ? talkingColors
@@ -214,7 +210,7 @@ const CompanionComponent = ({
   }, [callStatus, isMuted, waveActive, listeningColors, talkingColors])
 
   // ========= Getters para el Orb =========
-  // No usamos el mic real para input; damos una “respiración” cuando escucha.
+
   const getInputVolume = () => {
     if (orbState === 'listening') {
       const t = performance.now() / 600
@@ -229,7 +225,7 @@ const CompanionComponent = ({
     const muted = vapi.isMuted()
     vapi.setMuted(!muted)
     setIsMuted(!muted)
-    // si muteas, apaga el wave; si desmuteas y la call sigue activa, enciéndelo
+
     if (!muted) {
       setWaveActive(false)
     } else if (callStatus === CallStatus.ACTIVE) {
@@ -239,7 +235,6 @@ const CompanionComponent = ({
 
   const handleCall = async () => {
     setCallStatus(CallStatus.CONNECTING)
-    // activar el wave desde el click (user gesture)
     setWaveActive(true)
 
     const assistantOverrides = {
@@ -260,13 +255,11 @@ const CompanionComponent = ({
   return (
     <section className='flex flex-col h-[70vh]'>
       <section className='flex gap-8 max-sm:flex-col'>
-        {/* LADO AGENTE */}
         <div className='companion-section'>
           <div
             className='companion-avatar relative'
             style={{ backgroundColor: getSubjectColor(subject) }}
           >
-            {/* Ícono cuando inactivo/terminado */}
             <div
               className={cn(
                 'absolute inset-0 grid place-items-center transition-opacity duration-1000',
@@ -286,8 +279,6 @@ const CompanionComponent = ({
                 className='max-sm:w-fit'
               />
             </div>
-
-            {/* Orb cuando ACTIVO */}
             <div
               className={cn(
                 'absolute inset-0 grid place-items-center transition-opacity duration-1000',
@@ -298,23 +289,15 @@ const CompanionComponent = ({
                 <Orb
                   getInputVolume={getInputVolume}
                   getOutputVolume={getOutputVolume}
-                  agentState={orbState} // 'listening' | 'talking' | null
-                  // paleta inicial
-                  seed={orbSeedRef.current} // patrón consistente
-                  // motionIntensity={orbState === 'talking' ? 1.0 : 0.65}
-                  // detail={0.9}
+                  agentState={orbState}
+                  seed={orbSeedRef.current}
                 />
-              </div>
-              {/* Debug: quítalo si no lo quieres */}
-              <div className='absolute bottom-2 text-xs bg-black/50 text-white px-2 py-1 rounded'>
-                vol: {debugVol.toFixed(2)} | state: {orbState ?? 'idle'}
               </div>
             </div>
           </div>
           <p className='font-bold text-2xl'>{name}</p>
         </div>
 
-        {/* LADO USUARIO */}
         <div className='user-section w-full max-w-xs'>
           <div className='user-avatar flex items-center gap-3'>
             <Image
@@ -327,7 +310,6 @@ const CompanionComponent = ({
             <p className='font-bold text-xl'>{userName}</p>
           </div>
 
-          {/* Waveform TU MIC - wave arriba, botón abajo */}
           <div className='mt-4 w-full rounded-xl border border-neutral-200 bg-white/60 p-3 shadow-sm'>
             <LiveWaveform
               key={`wf-${waveActive}-${isMuted}-${callStatus}`}
@@ -336,16 +318,6 @@ const CompanionComponent = ({
               }
               processing={callStatus === CallStatus.CONNECTING}
               mode='static'
-              height={64}
-              barWidth={3}
-              barGap={2}
-              fadeEdges
-              historySize={120}
-              sensitivity={1.6}
-              smoothingTimeConstant={0.65}
-              fftSize={256}
-              updateRate={30}
-              // Importante: NO apagar waveActive desde estos callbacks
             />
 
             <button
@@ -365,7 +337,6 @@ const CompanionComponent = ({
             </button>
           </div>
 
-          {/* Botón de llamar/colgar */}
           <button
             className={cn(
               'mt-3 rounded-lg py-2 cursor-pointer transition-colors w-full text-white',
@@ -385,7 +356,6 @@ const CompanionComponent = ({
         </div>
       </section>
 
-      {/* TRANSCRIPCIÓN */}
       <section className='transcript'>
         <div className='transcript-message no-scrollbar'>
           {messages.map((message, index) => {
